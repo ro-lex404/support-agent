@@ -18,9 +18,7 @@ def get_system_prompt(custom_instructions: str = "") -> str:
     now = datetime.now()
     temporal_context = (
         f"\n[Temporal Context]\n"
-        f"Current Datetime: {now.strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"Current Day: {now.strftime('%A')}\n"
-        f"Timezone: Local System Time\n"
+        f"Current Date: {now.strftime('%Y-%m-%d (%A)')}\n"
     )
     
     prompt = DEFAULT_BASE_PROMPT + temporal_context

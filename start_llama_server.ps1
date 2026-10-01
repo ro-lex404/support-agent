@@ -16,7 +16,7 @@ if (-not (Test-Path $server)) {
 
 Write-Host "Starting llama-server with model: $($model.Name)" -ForegroundColor Green
 Write-Host "Listening on http://localhost:8080/v1 (OpenAI-compatible)" -ForegroundColor Cyan
-Write-Host "Dynamic Mode (Thinking dynamically controlled by client)" -ForegroundColor Yellow
+Write-Host "Direct Mode (Thinking disabled for instant tool calling)" -ForegroundColor Yellow
 Write-Host "Press Ctrl+C to stop the server." -ForegroundColor Gray
 
-& $server -m $model.FullName -c 2048 -t 2 -np 1 --reasoning auto --port 8080
+& $server -m $model.FullName -c 2048 -t 2 -np 1 --reasoning off --port 8080
