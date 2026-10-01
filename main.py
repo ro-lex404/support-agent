@@ -5,8 +5,10 @@ from core.prompts import get_system_prompt
 from core.agent import Agent
 from tools.base import registry
 
-# Import mock tools to trigger registration
+# Import tools to trigger registration
 import tools.mock_tools
+import tools.web_tools
+import tools.resume_tools
 
 def main():
     print("=" * 60)

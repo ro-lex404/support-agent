@@ -8,6 +8,7 @@ Key Guidelines:
 2. If you need external data or real-time action, call the appropriate tool.
 3. If the tool results give you the needed answer, synthesize a clear, helpful response for the user. Do not call tools needlessly.
 4. If you have enough information to fulfill the user's request, formulate your final response directly without calling further tools.
+5. PRIVACY GUARDRAIL: When formulating search queries for search_web, NEVER include personal identifiable information (PII) such as the user's name, email, phone number, address, or credentials. Always use generic, objective keywords.
 """
 
 def get_system_prompt(custom_instructions: str = "") -> str:

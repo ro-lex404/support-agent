@@ -1,5 +1,5 @@
 import json
-from typing import Dict, Any, List, Optional
+from typing import Dict, Any, List, Optional, Callable
 from openai import OpenAI
 from tools.base import ToolRegistry
 
@@ -15,7 +15,7 @@ class Agent:
         system_prompt: str,
         registry: ToolRegistry,
         max_iterations: int = 5,
-        max_tokens: int = 150,
+        max_tokens: int = 350,
         verbose: bool = True
     ):
         self.client = client
@@ -30,7 +30,7 @@ class Agent:
         if self.verbose:
             print(f"{prefix} {message}")
 
-    def run(self, user_goal: str) -> str:
+    def run(self, user_goal: str, on_step: Optional[Callable[[str], None]] = None) -> str:
         """
         Executes the autonomous loop until a final answer is generated
         or the maximum iteration limit is reached.
@@ -54,7 +54,8 @@ class Agent:
                     messages=messages,
                     tools=schemas if schemas else None,
                     tool_choice="auto" if schemas else None,
-                    max_tokens=self.max_tokens
+                    max_tokens=self.max_tokens,
+                    extra_body={"reasoning_budget": 0}
                 )
             except Exception as e:
                 self._log(f"LLM API Error: {e}", prefix="[Error]")
@@ -70,6 +71,8 @@ class Agent:
             tool_calls = getattr(message, "tool_calls", None)
             if not tool_calls:
                 self._log("Final answer generated.", prefix="[Completed]")
+                if on_step:
+                    on_step("✅ Final answer generated!")
                 return message.content or getattr(message, "reasoning_content", None) or "(Empty response)"
 
             # 3. Model decided to invoke one or more tools
@@ -78,6 +81,8 @@ class Agent:
                 raw_args = tool_call.function.arguments
 
                 self._log(f"Selected tool '{func_name}' with args: {raw_args}", prefix="[Action]")
+                if on_step:
+                    on_step(f"⚙️ Step {step}/{self.max_iterations}: Calling tool '{func_name}'...")
                 
                 try:
                     args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
@@ -93,6 +98,8 @@ class Agent:
                         self._log(f"Tool execution exception: {exec_err}", prefix="[Warning]")
 
                 self._log(f"Result -> {tool_result}", prefix="[Observation]")
+                if on_step:
+                    on_step(f"🔍 Step {step}/{self.max_iterations}: Received results from '{func_name}', reasoning...")
 
                 # 4. Feed tool result back into context
                 messages.append({

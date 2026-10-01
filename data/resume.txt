@@ -1,0 +1,22 @@
+# Candidate Profile / Resume
+
+## Education
+- B.Tech / B.E. in Computer Science & Engineering (4th Year / Senior Undergraduate)
+- Expected Graduation: 2027
+
+## Core Technical Skills
+- Programming Languages: Python, C++, SQL, Bash, JavaScript
+- AI / Machine Learning: PyTorch, Hugging Face Transformers, llama.cpp, LoRA / QLoRA fine-tuning, LangChain / Agentic Workflows, Scikit-learn
+- Backend & Systems: FastAPI, Flask, Docker, REST APIs, Git, Linux
+- Databases: PostgreSQL, SQLite, Vector Databases (ChromaDB, FAISS)
+
+## Projects & Experience
+- Autonomous Local Support Agent: Built a lightweight, zero-framework ReAct agent in pure Python running 100% offline via llama.cpp with dynamic tool calling and Telegram remote control.
+- LLM Fine-Tuning & Quantization: Experience fine-tuning small language models (Qwen, Llama) using QLoRA/Unsloth on Kaggle dual T4 GPUs, exporting to GGUF 4-bit quantizations.
+- Data Pipelines: Built web scraping and automated notification systems.
+
+## Target Roles
+- Junior AI Engineer
+- AI / LLM Developer Intern
+- Junior Python Backend Developer
+- Machine Learning Engineer (Entry Level)
