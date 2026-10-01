@@ -18,18 +18,24 @@ def search_web(query: str, max_results: int = 4) -> List[Dict[str, str]]:
         with DDGS() as ddgs:
             raw_results = list(ddgs.text(query, max_results=max_results))
             for r in raw_results:
-                results.append({
-                    "title": r.get("title", ""),
-                    "url": r.get("href", ""),
-                    "snippet": r.get("body", "")
-                })
+                title = (r.get("title") or "").strip()
+                href = (r.get("href") or "").strip()
+                raw_snippet = r.get("body") or ""
+                clean_snippet = re.sub(r"\s+", " ", raw_snippet).strip()
+                truncated_snippet = clean_snippet[:220]
+                if title and href:
+                    results.append({
+                        "title": title,
+                        "url": href,
+                        "snippet": truncated_snippet if truncated_snippet else "(No snippet provided)"
+                    })
         return results if results else [{"message": f"No results found for query: '{query}'"}]
     except Exception as e:
         return [{"error": f"Search failed: {str(e)}"}]
 
 @tool(
     name="read_webpage",
-    description="Fetches and extracts clean, readable text from a specific webpage URL (truncated to 1,200 characters to conserve context)."
+    description="Fetches and extracts clean, readable text from a specific webpage URL (truncated to 450 characters to conserve low-power CPU context)."
 )
 def read_webpage(url: str) -> Dict[str, Any]:
     """
@@ -55,8 +61,8 @@ def read_webpage(url: str) -> Dict[str, Any]:
         # Collapse multiple spaces and newlines
         clean_text = re.sub(r"\s+", " ", text).strip()
         
-        # Hard truncate to 1,200 characters to preserve 2048 token budget
-        truncated_text = clean_text[:1200]
+        # Truncate to 450 characters (~100 tokens) to ensure rapid CPU inference without timeouts
+        truncated_text = clean_text[:450]
         
         return {
             "url": url,

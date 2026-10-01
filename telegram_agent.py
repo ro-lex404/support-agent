@@ -24,69 +24,123 @@ load_dotenv()
 BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 ALLOWED_USER_ID = int(os.getenv("TELEGRAM_ALLOWED_USER_ID", "0"))
 
-# 2. Local LLM Client
+# 2. Local LLM Client with generous timeout (15 mins) to prevent connection drops on low-power CPU
 client = OpenAI(
     base_url=Config.LLM_BASE_URL,
-    api_key=Config.LLM_API_KEY
+    api_key=Config.LLM_API_KEY,
+    timeout=900.0
 )
 
-# In-memory conversation history (keeps track of chat + any tool outputs injected)
+# 3. Context & Sliding Window Management
+# On a dual-core CPU (~0.96 tokens/sec prefill), we strictly constrain prompt size to under 150 tokens.
+MAX_HISTORY_TURNS = 2  # Retains system prompt + last 2 turns (max 4 user/assistant messages)
+
+BASE_SYSTEM_PROMPT = (
+    "You are a helpful, factual, and concise personal AI assistant. "
+    "Provide direct, high-value answers without filler or repetition. "
+    "Keep answers strictly relevant to the question."
+)
+
 conversation_history = [
-    {"role": "system", "content": "You are a helpful, concise personal AI assistant. Keep responses clear and direct."}
+    {"role": "system", "content": BASE_SYSTEM_PROMPT}
 ]
 
 def is_authorized(update: Update) -> bool:
     return update.effective_user and update.effective_user.id == ALLOWED_USER_ID
 
-def update_system_context(info_text: str):
-    """Appends factual context to the primary system prompt at index 0 (safe for Jinja template)."""
-    conversation_history[0]["content"] += f"\n\n[Context Update]:\n{info_text}"
+def trim_history():
+    """Maintains system prompt at index 0 and evicts older messages beyond MAX_HISTORY_TURNS."""
+    global conversation_history
+    if len(conversation_history) > 1 + (2 * MAX_HISTORY_TURNS):
+        conversation_history = [conversation_history[0]] + conversation_history[-(2 * MAX_HISTORY_TURNS):]
 
-async def ask_llm(user_prompt: str, context_info: str = "") -> str:
-    """Helper to query the local LLM without violating Jinja role alternation rules."""
-    messages = list(conversation_history)
-    
+def set_system_context(info_text: str):
+    """Safely sets dynamic factual context in the system prompt without unbounded token growth."""
+    clean_info = info_text.strip()[:200]
+    conversation_history[0]["content"] = f"{BASE_SYSTEM_PROMPT}\n\n[Active Context]:\n{clean_info}"
+
+async def safe_reply(target, text: str, edit_msg=None, disable_preview: bool = True):
+    """Safely sends or edits text in Telegram, falling back to plain text if Markdown parsing fails."""
+    trimmed = text[:4000]
+    try:
+        if edit_msg:
+            return await edit_msg.edit_text(trimmed, parse_mode="Markdown", disable_web_page_preview=disable_preview)
+        else:
+            return await target.reply_text(trimmed, parse_mode="Markdown", disable_web_page_preview=disable_preview)
+    except Exception:
+        if edit_msg:
+            return await edit_msg.edit_text(trimmed, disable_web_page_preview=disable_preview)
+        else:
+            return await target.reply_text(trimmed, disable_web_page_preview=disable_preview)
+
+async def ask_llm(user_prompt: str, context_info: str = "", isolated: bool = False, max_tokens: int = 120) -> str:
+    """
+    Safely queries the local LLM:
+    - isolated=True: used for search/read synthesis, passes ONLY system prompt + retrieved snippet
+      to avoid evaluating bloated history.
+    - isolated=False: used for natural conversational chat, passes sliding window history.
+    - Enforces max_tokens to prevent CPU generation stalls.
+    """
+    if isolated:
+        messages = [conversation_history[0]]
+    else:
+        trim_history()
+        messages = list(conversation_history)
+
     if context_info:
-        full_content = f"[Retrieved Information]:\n{context_info}\n\n[Request]:\n{user_prompt}"
+        full_content = (
+            f"Retrieved Facts:\n{context_info.strip()}\n\n"
+            f"User Question: {user_prompt}\n\n"
+            f"Instruction: Answer concisely in 2-3 direct sentences based ONLY on the retrieved facts above. No fluff."
+        )
     else:
         full_content = user_prompt
 
     messages.append({"role": "user", "content": full_content})
 
     loop = asyncio.get_running_loop()
-    response = await loop.run_in_executor(
-        None,
-        lambda: client.chat.completions.create(
-            model=Config.LLM_MODEL,
-            messages=messages,
-            max_tokens=300,
-            temperature=0.4,
-            extra_body={"reasoning_budget": 0}
+    try:
+        response = await loop.run_in_executor(
+            None,
+            lambda: client.chat.completions.create(
+                model=Config.LLM_MODEL,
+                messages=messages,
+                max_tokens=max_tokens,
+                temperature=0.3,
+                extra_body={"reasoning_budget": 0}
+            )
         )
-    )
-    reply = response.choices[0].message.content or "(No response)"
+        reply = (response.choices[0].message.content or "").strip()
+        if not reply:
+            reply = "(No response generated)"
+    except Exception as e:
+        reply = f"⚠️ Generation notice: {str(e)}"
+
+    # Append to sliding history so follow-up questions work
     conversation_history.append({"role": "user", "content": user_prompt})
     conversation_history.append({"role": "assistant", "content": reply})
+    trim_history()
+
     return reply
 
-# /start command
+# /start and /help command
 async def start_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
-    await update.message.reply_text(
+    text = (
         "👋 **Deterministic Local AI Assistant**\n\n"
         "⚡ **Direct Tool Commands (Instant / ~15s):**\n"
         "• `/time` -> Current system date & time\n"
-        "• `/search <query>` -> Live DuckDuckGo search + AI summary\n"
+        "• `/search <query>` -> DuckDuckGo search + AI summary\n"
         "• `/read <url>` -> Extract & summarize webpage\n"
         "• `/emails` -> Check unread emails\n"
         "• `/calendar [YYYY-MM-DD]` -> Check events\n"
-        "• `/resume` -> View your local resume summary\n"
-        "• `/fit <Role> | <Skills>` -> Calculate job fit percentage\n"
-        "• `/clear` -> Reset chat history\n\n"
-        "💬 Or simply send any message to chat directly!",
-        parse_mode="Markdown"
+        "• `/resume` -> View local resume summary\n"
+        "• `/fit <Role> | <Skills>` -> Calculate job fit\n"
+        "• `/clear` -> Reset chat history & context\n\n"
+        "💬 Or simply send any message to chat directly!"
     )
+    await safe_reply(update.message, text)
 
 # /clear command
 async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -94,9 +148,9 @@ async def clear_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     global conversation_history
     conversation_history = [
-        {"role": "system", "content": "You are a helpful, concise personal AI assistant. Keep responses clear and direct."}
+        {"role": "system", "content": BASE_SYSTEM_PROMPT}
     ]
-    await update.message.reply_text("🧹 Conversation history cleared.")
+    await safe_reply(update.message, "🧹 Conversation history cleared. Ready for fresh queries.")
 
 # /time tool
 async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -104,66 +158,78 @@ async def time_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     t = get_current_time()
     msg = f"🕒 **Current Local Time:**\n• Date: `{t['date']}` ({t['day']})\n• Time: `{t['time']}`"
-    # Inject into context so subsequent chats know the time
-    update_system_context(f"Current system date/time is {t['datetime']} ({t['day']}).")
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    
+    # Store bounded fact in system context
+    set_system_context(f"Current date/time: {t['datetime']} ({t['day']})")
+    
+    # Record into sliding history so follow-ups like 'what time is it' work naturally
+    conversation_history.append({"role": "user", "content": "What is the current time and date?"})
+    conversation_history.append({"role": "assistant", "content": f"The current date is {t['date']} ({t['day']}) and time is {t['time']}."})
+    trim_history()
+    
+    await safe_reply(update.message, msg)
 
 # /search tool
 async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     if not context.args:
-        await update.message.reply_text("Usage: `/search <query>`\nExample: `/search bangalore weather today`", parse_mode="Markdown")
+        await safe_reply(update.message, "Usage: `/search <query>`\nExample: `/search Ariana grande`")
         return
 
     query = " ".join(context.args)
     status_msg = await update.message.reply_text(f"🔍 Searching DuckDuckGo for: `{query}`...", parse_mode="Markdown")
-    
+
     # 1. Python executes search instantly
     results = search_web(query, max_results=3)
-    
+
     if not results or "error" in results[0]:
-        await status_msg.edit_text(f"⚠️ Search error: {results[0].get('error', 'No results found')}")
+        err_msg = results[0].get("error", "No results found") if results else "No results found"
+        await safe_reply(update.message, f"⚠️ Search error: {err_msg}", edit_msg=status_msg)
         return
 
-    # Format text preview
-    snippets_text = ""
-    for idx, r in enumerate(results, 1):
-        snippets_text += f"{idx}. {r.get('title')}\nURL: {r.get('url')}\nSummary: {r.get('snippet')}\n\n"
+    valid_results = [r for r in results if r.get("title") and r.get("url")]
+    if not valid_results:
+        await safe_reply(update.message, f"ℹ️ No relevant web results found for `{query}`.", edit_msg=status_msg)
+        return
 
-    await status_msg.edit_text(f"🔍 Found results for `{query}`. Synthesizing answer...", parse_mode="Markdown")
-    
-    # 2. Local LLM summarizes search results (takes ~15-20s without heavy schemas)
-    prompt = f"Based on the following search results, concisely answer: '{query}'"
-    answer = await ask_llm(prompt, context_info=snippets_text)
-    
+    await safe_reply(update.message, f"🔍 Found {len(valid_results)} results. Synthesizing concise answer...", edit_msg=status_msg)
+
+    # 2. Build tightly bounded snippets (top 2 results, max 180 chars each = ~80 tokens)
+    snippets_text = "\n".join([f"• {r['title']}: {r.get('snippet', '')[:180]}" for r in valid_results[:2]])
+
+    # 3. Local LLM synthesizes answer with isolated=True (no history bloat, max 100 tokens generation)
+    prompt = f"What are the key facts about '{query}'?"
+    answer = await ask_llm(prompt, context_info=snippets_text, isolated=True, max_tokens=100)
+
+    # 4. Format clean response with source links
     final_output = f"🔍 **Search Results for:** _{query}_\n\n{answer}\n\n**Sources:**\n"
-    for r in results:
-        final_output += f"• [{r.get('title')}]({r.get('url')})\n"
-        
-    await status_msg.edit_text(final_output[:4000], parse_mode="Markdown", disable_web_page_preview=True)
+    for r in valid_results[:3]:
+        final_output += f"• [{r['title']}]({r['url']})\n"
+
+    await safe_reply(update.message, final_output, edit_msg=status_msg, disable_preview=True)
 
 # /read tool
 async def read_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not is_authorized(update):
         return
     if not context.args:
-        await update.message.reply_text("Usage: `/read <url>`\nExample: `/read https://example.com/article`", parse_mode="Markdown")
+        await safe_reply(update.message, "Usage: `/read <url>`\nExample: `/read https://en.wikipedia.org/wiki/Artificial_intelligence`")
         return
 
     url = context.args[0]
-    status_msg = await update.message.reply_text(f"📖 Scraping & extracting text from:\n`{url}`...", parse_mode="Markdown")
-    
+    status_msg = await update.message.reply_text(f"📖 Fetching webpage text from:\n`{url}`...", parse_mode="Markdown")
+
     data = read_webpage(url)
     if "error" in data:
-        await status_msg.edit_text(f"⚠️ Error reading webpage: {data['error']}")
+        await safe_reply(update.message, f"⚠️ Error reading webpage: {data['error']}", edit_msg=status_msg)
         return
 
-    await status_msg.edit_text("📖 Page extracted. Summarizing key insights...", parse_mode="Markdown")
-    prompt = f"Summarize the key takeaways from this article in 3-4 bullet points."
-    answer = await ask_llm(prompt, context_info=f"Webpage content ({url}):\n{data['text']}")
-    
-    await status_msg.edit_text(f"📖 **Summary for:** {url}\n\n{answer}")
+    await safe_reply(update.message, "📖 Extracted page text. Summarizing key insights...", edit_msg=status_msg)
+    prompt = "Summarize the key takeaways from this page excerpt in 2-3 concise bullet points:"
+    answer = await ask_llm(prompt, context_info=data["text"], isolated=True, max_tokens=100)
+
+    await safe_reply(update.message, f"📖 **Summary for:** {url}\n\n{answer}", edit_msg=status_msg)
 
 # /emails tool
 async def emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -173,9 +239,13 @@ async def emails_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     out = "📬 **Unread Emails:**\n\n"
     for e in emails:
         out += f"• **From:** {e['sender']}\n  **Subject:** {e['subject']}\n  **Snippet:** {e['snippet']}\n\n"
-    
-    update_system_context(f"User unread emails:\n{out}")
-    await update.message.reply_text(out, parse_mode="Markdown")
+
+    set_system_context(f"Unread emails: {len(emails)} emails from {', '.join([e['sender'] for e in emails[:3]])}")
+    conversation_history.append({"role": "user", "content": "Check unread emails."})
+    conversation_history.append({"role": "assistant", "content": f"You have {len(emails)} unread emails. Recent senders: {', '.join([e['sender'] for e in emails[:3]])}."})
+    trim_history()
+
+    await safe_reply(update.message, out)
 
 # /calendar tool
 async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -183,16 +253,22 @@ async def calendar_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     date_str = context.args[0] if context.args else datetime.now().strftime("%Y-%m-%d")
     events = check_calendar_events(date_str)
-    
+
     if not events:
         out = f"📅 No events scheduled for `{date_str}`."
+        summary = f"No events scheduled for {date_str}."
     else:
         out = f"📅 **Schedule for {date_str}:**\n\n"
         for ev in events:
             out += f"• **{ev['title']}**\n  Time: {ev['start']} to {ev['end']}\n  Location: {ev.get('location', 'N/A')}\n\n"
-            
-    update_system_context(f"User schedule for {date_str}:\n{out}")
-    await update.message.reply_text(out, parse_mode="Markdown")
+        summary = f"Events on {date_str}: {', '.join([ev['title'] for ev in events])}."
+
+    set_system_context(summary)
+    conversation_history.append({"role": "user", "content": f"Check calendar for {date_str}."})
+    conversation_history.append({"role": "assistant", "content": summary})
+    trim_history()
+
+    await safe_reply(update.message, out)
 
 # /resume tool
 async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -200,7 +276,7 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     res = get_my_resume_summary()
     if "error" in res:
-        await update.message.reply_text(f"⚠️ {res['error']}")
+        await safe_reply(update.message, f"⚠️ {res['error']}")
         return
 
     skills = ", ".join(res.get("skills_detected", []))
@@ -211,8 +287,12 @@ async def resume_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"• **Target Roles:** {roles}\n"
         f"• **Skills Detected ({len(res.get('skills_detected', []))}):** `{skills}`\n"
     )
-    update_system_context(f"User Resume Context:\n{res['resume_preview']}")
-    await update.message.reply_text(out, parse_mode="Markdown")
+    set_system_context(f"Resume: {res['education']}, Skills: {skills[:120]}")
+    conversation_history.append({"role": "user", "content": "Show my resume profile."})
+    conversation_history.append({"role": "assistant", "content": f"Education: {res['education']}. Target roles: {roles}. Skills: {skills[:120]}."})
+    trim_history()
+
+    await safe_reply(update.message, out)
 
 # /fit tool
 async def fit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -220,7 +300,7 @@ async def fit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
     full_arg = " ".join(context.args)
     if not full_arg or "|" not in full_arg:
-        await update.message.reply_text("Usage: `/fit <Job Title> | <Required Skills>`\nExample: `/fit Junior AI Engineer | Python, PyTorch, Docker, AWS`", parse_mode="Markdown")
+        await safe_reply(update.message, "Usage: `/fit <Job Title> | <Required Skills>`\nExample: `/fit Junior AI Engineer | Python, PyTorch, Docker, AWS`")
         return
 
     parts = full_arg.split("|", 1)
@@ -228,7 +308,7 @@ async def fit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     skills = parts[1].strip()
 
     data = analyze_job_fit(job_title=title, required_skills=skills)
-    
+
     msg = (
         f"🎯 **Job Fit Analysis for:** `{data['job_title']}`\n\n"
         f"• **Match Score:** `{data['match_percentage']}%` ({data['assessment']})\n"
@@ -236,7 +316,7 @@ async def fit_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"✅ **Matching Skills:** `{', '.join(data['matching_skills']) or 'None'}`\n"
         f"⚠️ **Missing Skills:** `{', '.join(data['missing_skills']) or 'None'}`\n"
     )
-    await update.message.reply_text(msg, parse_mode="Markdown")
+    await safe_reply(update.message, msg)
 
 # /agent command (Unified router that accepts `/agent <tool_name>` or `/agent <query>`)
 async def agent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -249,7 +329,6 @@ async def agent_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     subcommand = context.args[0].lower()
     sub_args = context.args[1:]
 
-    # Map subcommands to direct tools
     if subcommand in ("time", "clock", "date"):
         await time_command(update, context)
     elif subcommand in ("search", "web", "google"):
@@ -279,13 +358,16 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user_text = update.message.text
+    if not user_text:
+        return
+
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
 
     try:
-        reply = await ask_llm(user_text)
-        await update.message.reply_text(reply)
+        reply = await ask_llm(user_text, isolated=False, max_tokens=120)
+        await safe_reply(update.message, reply)
     except Exception as e:
-        await update.message.reply_text(f"⚠️ Error: {str(e)}")
+        await safe_reply(update.message, f"⚠️ Error: {str(e)}")
 
 def main():
     if not BOT_TOKEN or not ALLOWED_USER_ID:
@@ -296,6 +378,7 @@ def main():
     print("  Deterministic Telegram Local AI Assistant")
     print(f"  Target LLM: {Config.LLM_MODEL} @ {Config.LLM_BASE_URL}")
     print(f"  Authorized User ID: {ALLOWED_USER_ID}")
+    print(f"  History Sliding Window: {MAX_HISTORY_TURNS} turns max")
     print("=" * 60)
 
     app = ApplicationBuilder().token(BOT_TOKEN).build()
