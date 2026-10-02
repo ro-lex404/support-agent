@@ -5,7 +5,7 @@
 - Expected Graduation: 2027
 
 ## Core Technical Skills
-- Programming Languages: Python, C++, SQL, Bash, JavaScript
+- Programming Languages: Python, SQL, Bash, JavaScript
 - AI / Machine Learning: PyTorch, Hugging Face Transformers, llama.cpp, LoRA / QLoRA fine-tuning, LangChain / Agentic Workflows, Scikit-learn
 - Backend & Systems: FastAPI, Flask, Docker, REST APIs, Git, Linux
 - Databases: PostgreSQL, SQLite, Vector Databases (ChromaDB, FAISS)

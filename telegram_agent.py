@@ -13,6 +13,7 @@ from telegram.ext import (
 )
 from openai import OpenAI
 from config import Config
+from contextlib import asynccontextmanager
 
 # Import deterministic Python tools
 from tools.mock_tools import get_current_time, list_unread_emails, check_calendar_events
@@ -73,6 +74,33 @@ async def safe_reply(target, text: str, edit_msg=None, disable_preview: bool = T
         else:
             return await target.reply_text(trimmed, disable_web_page_preview=disable_preview)
 
+@asynccontextmanager
+async def keep_typing(bot, chat_id: int, interval: float = 4.0):
+    """
+    Heartbeat that sends Telegram's 'typing' action every 4 seconds
+    until the enclosed code block finishes.
+    """
+    stop_event = asyncio.Event()
+
+    async def _heartbeat():
+        while not stop_event.is_set():
+            try:
+                await bot.send_chat_action(chat_id=chat_id, action=ChatAction.TYPING)
+            except Exception:
+                pass
+            try:
+                # Sleep for interval or wake up immediately when stop_event is set
+                await asyncio.wait_for(stop_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+
+    task = asyncio.create_task(_heartbeat())
+    try:
+        yield
+    finally:
+        stop_event.set()
+        await task
+
 async def ask_llm(user_prompt: str, context_info: str = "", isolated: bool = False, max_tokens: int = 120) -> str:
     """
     Safely queries the local LLM:
@@ -80,6 +108,7 @@ async def ask_llm(user_prompt: str, context_info: str = "", isolated: bool = Fal
       to avoid evaluating bloated history.
     - isolated=False: used for natural conversational chat, passes sliding window history.
     - Enforces max_tokens to prevent CPU generation stalls.
+    - Sends a chat action to the user while the LLM is generating a response.
     """
     if isolated:
         messages = [conversation_history[0]]
@@ -200,7 +229,8 @@ async def search_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # 3. Local LLM synthesizes answer with isolated=True (no history bloat, max 100 tokens generation)
     prompt = f"What are the key facts about '{query}'?"
-    answer = await ask_llm(prompt, context_info=snippets_text, isolated=True, max_tokens=100)
+    async with keep_typing(context.bot, update.effective_chat.id):
+        answer = await ask_llm(prompt, context_info=snippets_text, isolated=True, max_tokens=100)
 
     # 4. Format clean response with source links
     final_output = f"🔍 **Search Results for:** _{query}_\n\n{answer}\n\n**Sources:**\n"
@@ -227,7 +257,8 @@ async def read_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     await safe_reply(update.message, "📖 Extracted page text. Summarizing key insights...", edit_msg=status_msg)
     prompt = "Summarize the key takeaways from this page excerpt in 2-3 concise bullet points:"
-    answer = await ask_llm(prompt, context_info=data["text"], isolated=True, max_tokens=100)
+    async with keep_typing(context.bot, update.effective_chat.id):
+        answer = await ask_llm(prompt, context_info=data["text"], isolated=True, max_tokens=100)
 
     await safe_reply(update.message, f"📖 **Summary for:** {url}\n\n{answer}", edit_msg=status_msg)
 
@@ -360,11 +391,12 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_text = update.message.text
     if not user_text:
         return
-
+    
     await context.bot.send_chat_action(chat_id=update.effective_chat.id, action=ChatAction.TYPING)
-
+    
     try:
-        reply = await ask_llm(user_text, isolated=False, max_tokens=120)
+        async with keep_typing(context.bot, chat_id=update.effective_chat.id):
+            reply = await ask_llm(user_text, isolated=False, max_tokens=120)
         await safe_reply(update.message, reply)
     except Exception as e:
         await safe_reply(update.message, f"⚠️ Error: {str(e)}")
